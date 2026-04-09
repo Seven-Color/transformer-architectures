@@ -141,7 +141,7 @@ class TransformerEncoderLayerAttention(nn.Module):
 
 
 class TransformerEncoderAttention(nn.Module):
-    def __init__(self, num_layers, d_model, nhead, dim_feedforward=2048, dropout=0.1, attention_type='multihead'):
+    def __init__(self, num_layers=8, d_model=512, nhead=8, dim_feedforward=2048, dropout=0.1, attention_type='multihead'):
         super().__init__()
         self.d_model = d_model
         self.pos_encoder = PositionalEncoding(d_model)

@@ -145,7 +145,7 @@ class TransformerEncoderLayerResidual(nn.Module):
 
 class TransformerEncoderResidual(nn.Module):
     """Transformer encoder with configurable residual connection strategies"""
-    def __init__(self, num_layers, d_model, nhead, dim_feedforward=2048, dropout=0.1, use_pre_norm=True):
+    def __init__(self, num_layers=8, d_model=512, nhead=8, dim_feedforward=2048, dropout=0.1, use_pre_norm=True):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayerResidual(d_model, nhead, dim_feedforward, dropout, use_pre_norm)

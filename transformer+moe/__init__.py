@@ -99,7 +99,7 @@ class TransformerEncoderLayerMoE(nn.Module):
 
 
 class TransformerEncoderMoE(nn.Module):
-    def __init__(self, num_layers, d_model, nhead, num_experts=4, top_k=2, dropout=0.1):
+    def __init__(self, num_layers=8, d_model=512, nhead=8, num_experts=4, top_k=2, dropout=0.1):
         super().__init__()
         self.d_model = d_model
         self.pos_encoder = PositionalEncoding(d_model)
