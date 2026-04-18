@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Tuple, Dict, Any
 
 from .blocks.rwkv_attention import (
     RWKVTimeMixing,
@@ -123,6 +123,116 @@ class SpectralRWKVLayer(nn.Module):
             f=f, h=h, h_ffn_mult=h_ffn_mult, dropout=dropout
         )
         self.dropout_ffn = nn.Dropout(dropout)
+
+        # ---- Streaming helpers ----
+        # TimeConv1D needs a history buffer for temporal context
+        # We store recent (kernel_size - 1) frames
+        self._time_buf = None  # rolling buffer, set in streaming init
+
+    def init_streaming_state(self, batch_size: int, device: torch.device):
+        """
+        Initialize per-layer streaming state.
+
+        Returns a dict with:
+          attn_state: None or zeros (depends on attention mode)
+          time_buffer: ring buffer of recent frames for TimeConv1D
+        """
+        d_attn = self.f * self.h
+
+        # Attention state
+        if self.attention_mode == "rwkv":
+            attn_state = torch.zeros(batch_size, self.attn.d_state, device=device)
+        elif self.attention_mode == "self_attention":
+            # KV cache: (k_cache, v_cache), each (B, nhead, seen_T, d_k)
+            # Start empty — first frame initializes
+            attn_state = None
+        else:
+            attn_state = None
+
+        # TimeConv1D needs (kernel_size - 1) previous frames as buffer
+        # Buffer: (B, kernel_size-1, F, H)
+        time_buf = torch.zeros(
+            batch_size, self.time_conv.kernel_size - 1, self.f, self.h,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        return {"attn_state": attn_state, "time_buffer": time_buf}
+
+    def forward_streaming(
+        self,
+        x: torch.Tensor,
+        state: dict,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Process a single frame with streaming state.
+
+        Args:
+            x: (B, 1, F, H) — single frame
+            state: dict with 'attn_state' and 'time_buffer'
+
+        Returns:
+            output: (B, 1, F, H)
+            new_state: updated dict
+        """
+        B, T, F, H = x.shape
+        assert T == 1, "Streaming expects single frame"
+        d = F * H
+
+        # ---- 1. Attention with state ----
+        x_flat = x.reshape(B, 1, d)
+        x_norm = self.norm_attn(x_flat)
+
+        if self.attention_mode == "rwkv":
+            attn_out, new_attn_state = self.attn.forward_streaming(
+                x_norm, state["attn_state"]
+            )
+            attn_out = attn_out.reshape(B, 1, F, H)
+        else:  # self_attention
+            attn_out, new_attn_state = self.attn.forward_streaming(
+                x, state["attn_state"]
+            )
+            attn_out = self.dropout_attn(attn_out)
+
+        x = x + attn_out  # residual
+
+        # ---- 2. Frequency Conv (stateless, per-frame) ----
+        x_flat = x.reshape(B, 1, d)
+        x_norm = self.norm_freq(x_flat).reshape(B, 1, F, H)
+        freq_out = self.freq_conv(x_norm)
+        x = x + self.dropout_freq(freq_out)
+
+        # ---- 3. Time Conv with rolling buffer ----
+        # Get time history from buffer
+        time_buf = state["time_buffer"]  # (B, kernel-1, F, H)
+
+        # Build full context: [buf_frames..., current_frame]
+        # Conv1d needs (B, C, T) — T = kernel_size
+        x_time = torch.cat([time_buf, x], dim=1)  # (B, kernel_size, F, H)
+
+        # Update rolling buffer: drop oldest, add current
+        new_time_buf = torch.cat(
+            [time_buf[:, 1:], x], dim=1
+        )  # (B, kernel_size-1, F, H)
+
+        # TimeConv: (B, kernel_size, F, H) -> conv over T dim
+        # reshape to (B, f*h, T) for Conv1d
+        x_flat = x_time.permute(0, 2, 3, 1).reshape(B, d, self.time_conv.kernel_size)
+        x_conv = self.time_conv.conv(x_flat)  # (B, f*h, T_out)
+        # Take ONLY the last temporal position = current frame's conv result
+        x_conv = x_conv[:, :, -1:]  # (B, f*h, 1)
+        x_conv = x_conv.reshape(B, 1, d)
+        x_conv = self.time_conv.norm(x_conv).reshape(B, 1, F, H)
+        x = x + self.dropout_time(x_conv)
+
+        # ---- 4. FFN (stateless, per-frame) ----
+        x = x + self.dropout_ffn(self.ffn(x))
+
+        new_state = {
+            "attn_state": new_attn_state,
+            "time_buffer": new_time_buf,
+        }
+        return x, new_state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -262,6 +372,81 @@ class RWKVSpectral(nn.Module):
 
     def get_parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def init_streaming_state(
+        self, batch_size: int, device: torch.device
+    ) -> List[Dict[str, Any]]:
+        """
+        Initialize streaming state for all layers.
+
+        Args:
+            batch_size: batch dimension B
+            device: torch device
+
+        Returns:
+            List of per-layer state dicts (one per layer)
+        """
+        return [
+            layer.init_streaming_state(batch_size, device)
+            for layer in self.layers
+        ]
+
+    def forward_streaming(
+        self,
+        x: torch.Tensor,
+        states: List[Dict[str, Any]],
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+        """
+        Stream one frame at a time through all layers.
+
+        This is the key streaming interface. Each call processes a single
+        frame (B, 1, F, H) using accumulated state from previous frames.
+
+        Args:
+            x: (B, 1, F, H) — single frame
+            states: List of per-layer state dicts from init_streaming_state
+                    or previous forward_streaming call
+
+        Returns:
+            output: (B, 1, F, H)
+            new_states: updated list of per-layer states
+        """
+        B, T, F, H = x.shape
+        assert T == 1, "forward_streaming expects single frame"
+
+        # Input projection
+        x = self.input_norm(self.input_proj(x))
+
+        # Pass through each layer with its state
+        new_states = []
+        for li, layer in enumerate(self.layers):
+            x, new_layer_state = layer.forward_streaming(x, states[li])
+            new_states.append(new_layer_state)
+
+        # Final norm
+        x = self.final_norm(x)
+
+        return x, new_states
+
+    def forward_one_step(
+        self,
+        x: torch.Tensor,
+        states: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+        """
+        Convenience wrapper: init state if None, then forward_streaming.
+
+        Args:
+            x: (B, 1, F, H) — single frame
+            states: None = initialize; or list from previous call
+
+        Returns:
+            output: (B, 1, F, H)
+            new_states: for next call
+        """
+        if states is None:
+            states = self.init_streaming_state(x.size(0), x.device)
+        return self.forward_streaming(x, states)
 
 
 # ============================================================

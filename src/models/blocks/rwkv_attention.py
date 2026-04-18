@@ -184,6 +184,66 @@ class RWKVTimeMixing(BaseAttention):
 
         return self.dropout(output), last_state
 
+    def forward_streaming(
+        self,
+        x: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Streaming single-frame forward — the core of RWKV inference.
+
+        Called per incoming frame. No token-shift across time (impossible
+        with only one frame). State carries all cross-frame history.
+
+        Args:
+            x: Single frame, (B, 1, F, H) or (B, 1, D)
+            state: Previous hidden state, (B, d_state). None = initialize.
+
+        Returns:
+            output: (B, 1, F, H) or (B, 1, D)
+            new_state: (B, d_state) — for next frame
+        """
+        original_shape = x.shape
+        if x.dim() == 4:
+            B, T, F, H = x.shape
+            assert T == 1, "Streaming expects single frame"
+            x = x.reshape(B, 1, F * H)
+        else:
+            B, T, D = x.shape
+            assert T == 1, "Streaming expects single frame"
+            F, H = 1, D
+
+        # Pre-norm (no token-shift possible with single frame)
+        x_norm = self.norm(x)
+
+        # k, v projections
+        k = self.key(x_norm)   # (B, 1, d_state)
+        v = self.value(x_norm)  # (B, 1, d_state)
+
+        w = torch.exp(self.time_decay)  # (d_state,)
+        u = self.time_first             # (d_state,)
+
+        # wkv for this single frame
+        wkv = torch.exp(
+            -torch.exp(u).unsqueeze(0).unsqueeze(0) * torch.sigmoid(k)
+        ) * v  # (B, 1, d_state)
+
+        # Initialize state if first frame
+        if state is None:
+            state = wkv.new_zeros(B, self.d_state)
+
+        # Recurrent state update — the only truly recurrent operation
+        new_state = state * w + wkv.squeeze(1)  # (B, d_state)
+
+        # Output projection
+        output = self.output(new_state)  # (B, d_attn)
+        output = output.unsqueeze(1)     # (B, 1, d_attn)
+
+        if len(original_shape) == 4:
+            output = output.reshape(B, 1, F, H)
+
+        return self.dropout(output), new_state.detach()
+
 
 class RWKVTimeMixingChunked(BaseAttention):
     """
@@ -529,6 +589,28 @@ class SelfAttentionFH(BaseAttention):
         out = self.out_proj(out).reshape(B, T, freq, ch)  # (B, T, F, H)
 
         return out, None
+
+    def forward_streaming(
+        self,
+        x: torch.Tensor,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Streaming single-frame forward with KV cache.
+
+        Uses cached K, V from all previous frames.
+        State is (k_cache, v_cache) — None for first frame.
+
+        Args:
+            x: (B, 1, F, H) — single frame
+            state: Optional (k_cache, v_cache)
+
+        Returns:
+            output: (B, 1, F, H)
+            new_state: (k_cache, v_cache) for next frame
+        """
+        output, new_cache = self.forward_with_cache(x, state)
+        return output, new_cache
 
     def forward_with_cache(
         self,
