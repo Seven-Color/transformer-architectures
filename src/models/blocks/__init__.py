@@ -10,7 +10,14 @@ from .attention import (
     BaseAttention
 )
 from .feedforward import FeedForward, FeedForwardMoE
-from .rwkv_attention import TimeMixing, ChannelMixing, RWKVLNBlock, RWKVState
+from .rwkv_attention import (
+    RWKVTimeMixing,
+    RWKVTimeMixingChunked,
+    SelfAttentionFH,
+    FreqConv1D,
+    TimeConv1D,
+    FFNH,
+)
 
 __all__ = [
     'PositionalEncoding',
@@ -22,8 +29,10 @@ __all__ = [
     'FeedForward',
     'FeedForwardMoE',
     # RWKV blocks
-    'TimeMixing',
-    'ChannelMixing',
-    'RWKVLNBlock',
-    'RWKVState'
+    'RWKVTimeMixing',
+    'RWKVTimeMixingChunked',
+    'SelfAttentionFH',
+    'FreqConv1D',
+    'TimeConv1D',
+    'FFNH',
 ]

@@ -14,26 +14,20 @@ from .transformer_residual import (
     ResBlock
 )
 from .denoising_transformer import (
-    # Factory
     create_denoising_transformer,
     DenoisingTransformerConfig,
-    # Comparison utilities
     compare_architectures,
     print_comparison,
-    # Model classes
     StandardDenoisingTransformer,
     ResidualAttentionDenoisingTransformer,
     MoEDenoisingTransformer,
-    # Attention variants
     StandardSelfAttention,
     ResidualAttention,
     PreNormResidualAttention,
     MultiScaleAttention,
-    # FFN variants
     StandardFFN,
     SwiGLUFFN,
     MoEFFN,
-    # Encoder layers
     StandardEncoderLayer,
     ResidualAttentionEncoderLayer,
     MoEEncoderLayer
@@ -45,14 +39,16 @@ from .blocks import (
     ScaledDotProductAttention,
     CausalSelfAttention,
     FeedForward,
-    FeedForwardMoE
+    FeedForwardMoE,
 )
-from .rwkv_model import RWKV7Model, RWKVConfig
+from .rwkv_model import RWKVSpectral, RWKVSpectralConfig, create_rwkv_spectral
 from .blocks.rwkv_attention import (
-    TimeMixing,
-    ChannelMixing,
-    RWKVLNBlock,
-    RWKVState
+    RWKVTimeMixing,
+    RWKVTimeMixingChunked,
+    SelfAttentionFH,
+    FreqConv1D,
+    TimeConv1D,
+    FFNH,
 )
 
 __all__ = [
@@ -73,12 +69,12 @@ __all__ = [
     'StandardDenoisingTransformer',
     'ResidualAttentionDenoisingTransformer',
     'MoEDenoisingTransformer',
-    # Attention
+    # Attention variants
     'StandardSelfAttention',
     'ResidualAttention',
     'PreNormResidualAttention',
     'MultiScaleAttention',
-    # FFN
+    # FFN variants
     'StandardFFN',
     'SwiGLUFFN',
     'MoEFFN',
@@ -93,11 +89,14 @@ __all__ = [
     'CausalSelfAttention',
     'FeedForward',
     'FeedForwardMoE',
-    # RWKV-7
-    'RWKV7Model',
-    'RWKVConfig',
-    'TimeMixing',
-    'ChannelMixing',
-    'RWKVLNBlock',
-    'RWKVState'
+    # RWKV Spectral
+    'RWKVSpectral',
+    'RWKVSpectralConfig',
+    'create_rwkv_spectral',
+    'RWKVTimeMixing',
+    'RWKVTimeMixingChunked',
+    'SelfAttentionFH',
+    'FreqConv1D',
+    'TimeConv1D',
+    'FFNH',
 ]

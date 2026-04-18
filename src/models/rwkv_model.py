@@ -1,246 +1,320 @@
 """
-RWKV-7 (Goose) Model Implementation.
+RWKV Spectral Model
+==================
 
-A transformer-free language model that achieves GPT-level performance
-using a novel linear-time architecture with:
-- Time Mixing (token-level linear attention with time decay)
-- Channel Mixing (GLU-style feed-forward)
-- Generalized Delta Rule for state evolution (RWKV-7)
+8-layer network for spectral/temporal modeling with shape (B, T, F, H).
 
-Reference:
-- RWKV-7 Paper: arXiv:2503.14456
-- RWKV Website: https://www.rwkv.cn
+Two attention modes:
+  1. "rwkv": RWKV Time Mixing (linear-time, O(T) per step)
+  2. "self_attention": Standard full attention across (f*h)
+
+Each layer structure:
+  Input (B, T, F, H)
+    |
+    +-> Attention(f*h) ----------------------------------------+
+    |   (RWKV or Self-Attn across time T)                      |
+    |                                                        |
+    +-> FreqConv1D (along F) --------------------------------+ |
+    |   (depthwise conv across frequency bins)                | |
+    |                                                        | |
+    +-> TimeConv1D (along T) ------------------------------+ | |
+    |   (conv across time frames)                             | | |
+    |                                                        | | |
+    +-> FFN(h) -------------------------------------------+ | | |
+        (channel-wise feed-forward)                           | | |
+                                                             | | |
+    Residual connections between each sub-layer               | | |
+                                                             | | |
+    Final output: (B, T, F, H)                               v v v
+
+Reference: RWKV-7 "Goose" - arXiv:2503.14456
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, List, Literal
 
-from ..core.base import BaseModule
-from .blocks.rwkv_attention import RWKVLNBlock, TimeMixing, ChannelMixing, RWKVState
-
-
-@dataclass
-class RWKVConfig:
-    """Configuration for RWKV-7 model."""
-    name: str = "RWKV-7"
-    vocab_size: int = 65536
-    d_model: int = 512
-    num_layers: int = 12
-    d_state: int = 64  # Hidden state dimension
-    d_ffn: Optional[int] = None  # Defaults to d_model * 4
-    dropout: float = 0.1
-    shift_size: float = 0.5
-    max_seq_len: int = 4096
-    tie_weights: bool = True
-    emb_dropout: float = 0.0
+from .blocks.rwkv_attention import (
+    RWKVTimeMixing,
+    RWKVTimeMixingChunked,
+    SelfAttentionFH,
+    FreqConv1D,
+    TimeConv1D,
+    FFNH,
+)
 
 
-class Embedding(nn.Module):
-    """Token embedding layer with optional dropout."""
+# ============================================================
+# Single RWKV Layer
+# ============================================================
 
-    def __init__(self, vocab_size: int, d_model: int, dropout: float = 0.0):
+class SpectralRWKVLayer(nn.Module):
+    """
+    One layer of the Spectral RWKV model.
+
+    Sub-components:
+      1. Attention (f*h)   - token mixing across time
+      2. FreqConv1D       - 1D conv along frequency F
+      3. TimeConv1D        - 1D conv along time T
+      4. FFN              - channel-wise feed-forward on H
+
+    Each sub-layer has a residual connection and layer norm.
+    """
+
+    def __init__(
+        self,
+        f: int,
+        h: int,
+        attention_mode: Literal["rwkv", "self_attention"] = "rwkv",
+        d_state: int = 64,
+        nhead: int = 8,
+        conv_kernel: int = 3,
+        h_ffn_mult: int = 4,
+        dropout: float = 0.1,
+        attn_dropout: float = 0.1,
+    ):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.d_model = d_model
+        self.f = f
+        self.h = h
+        self.attention_mode = attention_mode
+
+        d_attn = f * h
+
+        # Pre-normalization for attention
+        self.norm_attn = nn.LayerNorm(d_attn)
+
+        # Attention: RWKV or Standard Self-Attention
+        if attention_mode == "rwkv":
+            self.attn = RWKVTimeMixing(
+                d_attn=d_attn,
+                d_state=d_state,
+                dropout=attn_dropout,
+            )
+        elif attention_mode == "self_attention":
+            self.attn = SelfAttentionFH(
+                f=f,
+                h=h,
+                nhead=nhead,
+                dropout=attn_dropout,
+            )
+        else:
+            raise ValueError(f"Unknown attention_mode: {attention_mode}")
+
+        self.dropout_attn = nn.Dropout(dropout)
+
+        # Frequency convolution (along F)
+        self.norm_freq = nn.LayerNorm(d_attn)
+        self.freq_conv = FreqConv1D(
+            f=f, h=h, kernel_size=conv_kernel, dropout=dropout
+        )
+        self.dropout_freq = nn.Dropout(dropout)
+
+        # Time convolution (along T)
+        self.norm_time = nn.LayerNorm(d_attn)
+        self.time_conv = TimeConv1D(
+            f=f, h=h, kernel_size=conv_kernel, dropout=dropout
+        )
+        self.dropout_time = nn.Dropout(dropout)
+
+        # FFN (along H)
+        self.norm_ffn = nn.LayerNorm(h)
+        self.ffn = FFNH(
+            f=f, h=h, h_ffn_mult=h_ffn_mult, dropout=dropout
+        )
+        self.dropout_ffn = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.embedding(x) * (self.d_model ** 0.5))
-
-
-class PositionalEncoding(nn.Module):
-    """
-    RWKV does not use traditional positional encoding.
-    Instead, we use a simple learned absolute position embedding
-    that gets added during the time-shift operation.
-    """
-
-    def __init__(self, d_model: int, max_len: int = 4096):
-        super().__init__()
-        self.embedding = nn.Embedding(max_len, d_model)
-
-    def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
-        positions = torch.arange(seq_len, device=device).unsqueeze(0)
-        return self.embedding(positions)
-
-
-class RWKVModelBody(nn.Module):
-    """
-    Core RWKV body - stacks of RWKV blocks.
-    """
-
-    def __init__(self, config: RWKVConfig):
-        super().__init__()
-        self.config = config
-
-        self.layers = nn.ModuleList([
-            RWKVLNBlock(
-                d_model=config.d_model,
-                d_state=config.d_state,
-                d_ffn=config.d_ffn or config.d_model * 4,
-                dropout=config.dropout,
-                shift_size=config.shift_size,
-            )
-            for _ in range(config.num_layers)
-        ])
-
-        self.layer_norm = nn.LayerNorm(config.d_model)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        init_states: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
-            x: (batch_size, seq_len, d_model)
-            init_states: Optional list of initial states per layer
+            x: (B, T, F, H)
 
         Returns:
-            output: (batch_size, seq_len, d_model)
-            final_states: List of hidden states per layer
+            (B, T, F, H)
         """
-        layer_states = []
+        B, T, F, H = x.shape
+        d = F * H
 
-        for i, layer in enumerate(self.layers):
-            init_state = init_states[i] if init_states is not None else None
-            x, last_state = layer(x, init_state)
-            layer_states.append(last_state)
+        # ---- Attention with residual ----
+        x_flat = x.reshape(B, T, d)
+        x_norm = self.norm_attn(x_flat)
 
-        x = self.layer_norm(x)
-        return x, layer_states
+        if self.attention_mode == "rwkv":
+            attn_out, _ = self.attn(x_norm)
+            attn_out = attn_out.reshape(B, T, F, H)
+        else:
+            # SelfAttentionFH takes (B,T,F,H) directly
+            attn_out, _ = self.attn(x)
+            attn_out = self.dropout_attn(attn_out)
+
+        # Residual: attention
+        x = x + attn_out
+
+        # ---- Frequency Conv with residual ----
+        x_flat = x.reshape(B, T, d)
+        x_norm = self.norm_freq(x_flat).reshape(B, T, F, H)
+        freq_out = self.freq_conv(x_norm)
+        x = x + self.dropout_freq(freq_out)
+
+        # ---- Time Conv with residual ----
+        x_flat = x.reshape(B, T, d)
+        x_norm = self.norm_time(x_flat).reshape(B, T, F, H)
+        time_out = self.time_conv(x_norm)
+        x = x + self.dropout_time(time_out)
+
+        # ---- FFN with residual ----
+        x = x + self.dropout_ffn(self.ffn(x))
+
+        return x
 
 
-class RWKV7Model(BaseModule):
+# ============================================================
+# Full Model
+# ============================================================
+
+class RWKVSpectral(nn.Module):
     """
-    RWKV-7 (Goose) Language Model.
+    8-layer RWKV Spectral Network.
 
-    A GPT-level performance RNN that:
-    - Uses NO self-attention (100% attention-free)
-    - Has O(N) inference time and memory
-    - Supports unlimited context length (in principle)
-    - Achieves transformer-quality results
+    Input:  (B, T, F, H) - batch, time, frequency, channel
+    Output: (B, T, F, H) - same shape
 
     Architecture:
-        Token Embedding
-            -> RWKV Blocks (Time Mixing + Channel Mixing)
-            -> LayerNorm
-            -> Language Modeling Head
+      1. Input projection (optional): H -> H (identity by default)
+      2. 8 x SpectralRWKVLayer
+      3. Final layer norm
     """
 
-    def __init__(self, config: Optional[RWKVConfig] = None):
+    def __init__(
+        self,
+        f: int,
+        h: int,
+        num_layers: int = 8,
+        attention_mode: Literal["rwkv", "self_attention"] = "rwkv",
+        d_state: int = 64,
+        nhead: int = 8,
+        conv_kernel: int = 3,
+        h_ffn_mult: int = 4,
+        dropout: float = 0.1,
+        attn_dropout: float = 0.1,
+    ):
         super().__init__()
-        self.config = config or RWKVConfig()
+        self.f = f
+        self.h = h
+        self.num_layers = num_layers
+        self.attention_mode = attention_mode
 
-        cfg = self.config
+        # Input embedding: project channel dim
+        self.input_proj = nn.Linear(h, h)
+        self.input_norm = nn.LayerNorm(h)
 
-        # Embedding
-        self.embedding = Embedding(cfg.vocab_size, cfg.d_model, cfg.emb_dropout)
+        # Stack of RWKV layers
+        self.layers = nn.ModuleList([
+            SpectralRWKVLayer(
+                f=f,
+                h=h,
+                attention_mode=attention_mode,
+                d_state=d_state,
+                nhead=nhead,
+                conv_kernel=conv_kernel,
+                h_ffn_mult=h_ffn_mult,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+            )
+            for _ in range(num_layers)
+        ])
 
-        # Positional encoding (simple learned - optional for RWKV)
-        self.pos_encoding = PositionalEncoding(cfg.d_model, cfg.max_seq_len)
+        # Final normalization
+        self.final_norm = nn.LayerNorm(h)
 
-        # RWKV body
-        self.body = RWKVModelBody(cfg)
-
-        # Output head
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-
-        # Tie weights between embedding and output
-        if cfg.tie_weights:
-            self.head.weight = self.embedding.embedding.weight
-
-        # Initialize weights
+        # Initialize
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module):
-        """Initialize weights with appropriate schemes."""
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.LayerNorm):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        init_states: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input_ids: (batch_size, seq_len) - token indices
-            init_states: Optional list of initial hidden states per layer
+            x: (B, T, F, H)
 
         Returns:
-            logits: (batch_size, seq_len, vocab_size)
-            final_states: List of hidden states per layer
+            (B, T, F, H)
         """
-        # Embed tokens
-        x = self.embedding(input_ids)
+        # Input projection
+        B, T, F, H = x.shape
+        x = self.input_norm(self.input_proj(x))  # (B, T, F, H)
 
-        # Add positional info (subtle)
-        seq_len = x.size(1)
-        x = x + self.pos_encoding(seq_len, x.device) * 0.1
+        # Pass through all layers
+        for layer in self.layers:
+            x = layer(x)
 
-        # RWKV body
-        x, final_states = self.body(x, init_states)
+        # Final norm
+        x = self.final_norm(x)
 
-        # Language modeling head
-        logits = self.head(x)
-
-        return logits, final_states
-
-    def forward_one_step(
-        self,
-        input_ids: torch.Tensor,
-        states: Optional[List[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        RNN-style one-step forward (for autoregressive inference).
-
-        Args:
-            input_ids: (batch_size, 1) - single token
-            states: Hidden states from previous step
-
-        Returns:
-            logits: (batch_size, 1, vocab_size)
-            new_states: Updated hidden states
-        """
-        x = self.embedding(input_ids)
-        x = x + self.pos_encoding(1, x.device) * 0.1
-
-        layer_states = []
-        for i, layer in enumerate(self.body.layers):
-            state = states[i] if states is not None else None
-            x, last_state = layer(x, state)
-            layer_states.append(last_state)
-
-        x = self.body.layer_norm(x)
-        logits = self.head(x)
-
-        return logits, layer_states
-
-    def init_hidden_states(
-        self,
-        batch_size: int,
-        device: torch.device,
-    ) -> List[torch.Tensor]:
-        """Initialize hidden states for RNN-style inference."""
-        return [
-            torch.zeros(batch_size, self.config.d_state, device=device)
-            for _ in range(self.config.num_layers)
-        ]
+        return x
 
     def get_parameter_count(self) -> int:
-        """Return total number of trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-# Alias for convenience
-RWKV7 = RWKV7Model
+# ============================================================
+# Config
+# ============================================================
+
+@dataclass
+class RWKVSpectralConfig:
+    """Configuration for RWKV Spectral model."""
+    name: str = "RWKV-Spectral"
+
+    # Input dimensions
+    f: int = 257          # frequency bins
+    h: int = 64           # channels
+
+    # Architecture
+    num_layers: int = 8
+    attention_mode: Literal["rwkv", "self_attention"] = "rwkv"
+
+    # Attention params
+    d_state: int = 64     # RWKV hidden state dim
+    nhead: int = 8        # number of attention heads (self_attention mode)
+
+    # Conv params
+    conv_kernel: int = 3
+
+    # FFN params
+    h_ffn_mult: int = 4   # FFN hidden = h * h_ffn_mult
+
+    # Regularization
+    dropout: float = 0.1
+    attn_dropout: float = 0.1
+
+
+# ============================================================
+# Factory
+# ============================================================
+
+def create_rwkv_spectral(
+    f: int,
+    h: int,
+    num_layers: int = 8,
+    attention_mode: Literal["rwkv", "self_attention"] = "rwkv",
+    **kwargs,
+) -> RWKVSpectral:
+    """
+    Factory function to create a Spectral RWKV model.
+    """
+    return RWKVSpectral(
+        f=f,
+        h=h,
+        num_layers=num_layers,
+        attention_mode=attention_mode,
+        **kwargs,
+    )
