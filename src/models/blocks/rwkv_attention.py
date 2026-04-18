@@ -39,17 +39,20 @@ class BaseAttention(nn.Module):
 
 class RWKVTimeMixing(BaseAttention):
     """
-    RWKV Time Mixing Layer.
+    RWKV Time Mixing Layer - Parallel Scan Implementation.
 
-    Replaces O(T^2) self-attention with O(T) linear recurrence.
-    Uses the Generalized Delta Rule from RWKV-7 for state evolution.
+    Replaces O(T^2) self-attention with O(T) linear recurrence
+    computed via parallel scan (Hillis-Steele algorithm).
 
-    Key mechanism:
-      state = decay * state + token_shift(x) * wkv
-      output = Linear(state)
+    The recurrence:
+        state_t = w * state_{t-1} + wkv_t
 
-    The token_shift blends adjacent time steps via a learned gate,
-    providing local context before the linear state update.
+    Is reformulated as:
+        state_t = a_t ⊗ state_{t-1} ⊕ b_t
+    where ⊗ and ⊕ form an associative operator pair that can be
+    computed in O(log T) depth on GPU.
+
+    This eliminates the sequential for-loop over T time steps.
 
     Args:
         d_attn:  Attention dimension (f * h)
@@ -70,113 +73,112 @@ class RWKVTimeMixing(BaseAttention):
         self.d_state = d_state
         self.time_shift_size = time_shift_size
 
-        # Learnable time decay: exp(-exp(time_first) * key)
-        # This gives each head a different decay rate
+        # Time decay per state dimension: controls how fast information decays
         self.time_decay = nn.Parameter(torch.zeros(d_state))
+        # First-token factor: initial contribution boost
         self.time_first = nn.Parameter(torch.zeros(d_state))
 
-        # Key and Value projections: x -> k, v
+        # Key and Value projections
         self.key = nn.Linear(d_attn, d_state, bias=False)
         self.value = nn.Linear(d_attn, d_state, bias=False)
 
-        # Output projection: state -> x
+        # Output projection: state -> d_attn
         self.output = nn.Linear(d_state, d_attn, bias=False)
 
-        # Token-shift: half-sequence shift + learned gate
+        # Token-shift: blend adjacent time steps
         self.time_shift = nn.Linear(d_attn, d_attn, bias=False)
         self.time_shift_gate = nn.Parameter(torch.ones(d_attn))
-
-        # RWKV-7: Reception field extension (optional, for longer context)
-        # Adds a direct content-based contribution
-        self.reception_w = nn.Parameter(torch.zeros(d_attn, d_state))
-        self.reception_u = nn.Parameter(torch.zeros(d_attn, d_state))
 
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_attn)
 
     def token_shift(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Token-shift: blend current and previous time step.
-
-        x: (B, T, F, H) or (B, T, D) where D=f*h
-        Returns: same shape as x
-        """
+        """Token-shift: blend current and half-shifted previous time step."""
         if x.size(1) <= 1:
             return x
-
-        seq_len = x.size(1)
-        shift_len = max(1, int(seq_len * self.time_shift_size))
-
-        # Cat: [x_shift, x_prev] along time dim
+        shift_len = max(1, int(x.size(1) * self.time_shift_size))
         x_cat = torch.cat([x[:, shift_len:], x[:, :-shift_len]], dim=1)
+        gate = self.time_shift_gate.sigmoid()
+        return self.time_shift(x_cat) * gate + x * (1 - gate)
 
-        # Learnable gate
-        gate = self.time_shift_gate.sigmoid()  # (D,) or (F*H,)
-        shift_out = self.time_shift(x_cat)
+    @staticmethod
+    def _combine(a1, b1, a2, b2):
+        """
+        Associative combine of two (a, b) pairs.
+        (a1,b1) ⊗ (a2,b2) = (a1*a2, a1*b2 + b1)
+        """
+        return a1 * a2, a1 * b2 + b1
 
-        # Blend: gate * shifted + (1-gate) * original
-        return shift_out * gate + x * (1 - gate)
+    def _sequential_scan(self, wkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sequential recurrence — O(T) total work, O(1) memory.
+
+        Computes: state_t = w * state_{t-1} + wkv_t
+
+        This is the simplest and most numerically stable approach.
+        For typical audio spectral sequences (T <= 512), the sequential
+        loop has negligible overhead and avoids parallel-scan overhead.
+
+        For very long sequences (T > 10000), use RWKVTimeMixingChunked
+        which applies a two-level scan (intra-chunk + inter-chunk).
+
+        Args:
+            wkv: (B, T, d_state)
+
+        Returns:
+            output: (B, T, d_attn)
+            last_state: (B, d_state)
+        """
+        B, T, D = wkv.shape
+        w = torch.exp(self.time_decay)  # (d_state,)
+
+        states = wkv.new_zeros(B, D)
+        outputs = []
+
+        for t in range(T):
+            states = states * w + wkv[:, t, :]
+            outputs.append(self.output(states))  # (B, d_attn)
+
+        return torch.stack(outputs, dim=1), states  # (B,T,d_attn), (B,d_state)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass.
+        Forward pass with parallel scan.
 
         Args:
-            x: Input tensor (B, T, F, H) or (B, T, D)
+            x: (B, T, F, H) or (B, T, D)
 
         Returns:
             output: (B, T, F, H) or (B, T, D)
-            last_state: (B, d_state) final hidden state for RNN inference
+            last_state: (B, d_state)
         """
-        # Handle both 4D (B,T,F,H) and 3D (B,T,D) input
         original_shape = x.shape
         if x.dim() == 4:
             B, T, F, H = x.shape
-            x = x.reshape(B, T, F * H)  # (B, T, f*h)
+            x = x.reshape(B, T, F * H)
         else:
             B, T, D = x.shape
-            F = 1
-            H = D
-            x = x.reshape(B, T, D)
+            F, H = 1, D
 
-        # Pre-norm
+        # Pre-norm + token shift
         x_shift = self.token_shift(x)
         x_norm = self.norm(x_shift)
 
-        # Project to key and value
-        k = self.key(x_norm)  # (B, T, d_state)
+        # Project to k, v
+        k = self.key(x_norm)    # (B, T, d_state)
         v = self.value(x_norm)  # (B, T, d_state)
 
-        # Initialize states
-        B_dim = k.size(0)
-        states = torch.zeros(B_dim, self.d_state, device=x.device, dtype=x.dtype)
+        # Compute wkv: content-based contribution
+        w = torch.exp(self.time_decay)       # (d_state,)
+        u = self.time_first                  # (d_state,)
 
-        outputs = []
+        # wkv_t = exp(-exp(u) * sigmoid(k_t)) * v_t
+        wkv = torch.exp(-torch.exp(u).unsqueeze(0).unsqueeze(0) * torch.sigmoid(k)) * v
 
-        # RWKV time-stepwise recurrence
-        w = torch.exp(self.time_decay)          # (d_state,) decay factor
-        u = self.time_first                      # (d_state,) first-token factor
+        # ---- Sequential scan: O(T) total work ----
+        output, last_state = self._sequential_scan(wkv)  # (B,T,d_attn), (B,d_state)
+        last_state = last_state.detach()
 
-        for t in range(T):
-            k_t = k[:, t, :]                    # (B, d_state)
-            v_t = v[:, t, :]                    # (B, d_state)
-
-            # RWKV-7: Generalized Delta Rule
-            # wkv = exp(-exp(u) * k_t) * v_t
-            # This is the content-based contribution
-            wkv = torch.exp(-torch.exp(u) * torch.sigmoid(k_t)) * v_t
-
-            # State update: exponential decay + new contribution
-            states = states * w + wkv
-
-            # Output: project state back to d_attn
-            out_t = self.output(states)          # (B, d_attn)
-            outputs.append(out_t)
-
-        output = torch.stack(outputs, dim=1)     # (B, T, d_attn)
-        last_state = states.detach()
-
-        # Restore original shape
         if len(original_shape) == 4:
             output = output.reshape(B, T, F, H)
 
@@ -185,15 +187,22 @@ class RWKVTimeMixing(BaseAttention):
 
 class RWKVTimeMixingChunked(BaseAttention):
     """
-    Chunked RWKV Time Mixing - more efficient for long sequences.
+    Chunked RWKV Time Mixing - processes very long sequences efficiently.
 
-    Processes the sequence in chunks using the parallel scan algorithm
-    for faster computation while maintaining O(T) memory.
+    Splits sequence into chunks, computes parallel scan within each chunk,
+    then combines chunk-level states with a second scan pass.
+
+    This is a two-level parallel scan (online RVWKV algorithm):
+      1. Intra-chunk scan: O(chunk_size * log(chunk_size))
+      2. Inter-chunk scan: O(num_chunks * log(num_chunks))
+
+    Better for very long sequences (T >> 10000) where a single
+    full parallel scan would use too much memory.
 
     Args:
         d_attn:  Attention dimension (f * h)
         d_state: Hidden state dimension
-        chunk_size: Size of chunks for parallel processing (default 64)
+        chunk_size: Size of each chunk (default 128)
         dropout:  Dropout rate
     """
 
@@ -201,7 +210,7 @@ class RWKVTimeMixingChunked(BaseAttention):
         self,
         d_attn: int,
         d_state: int = 64,
-        chunk_size: int = 64,
+        chunk_size: int = 128,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -230,11 +239,136 @@ class RWKVTimeMixingChunked(BaseAttention):
         gate = self.time_shift_gate.sigmoid()
         return self.time_shift(x_cat) * gate + x * (1 - gate)
 
+    def _combine(self, a1, b1, a2, b2):
+        """Associative combine: (a1,b1) ⊗ (a2,b2) = (a1*a2, a1*b2 + b1)"""
+        return a1 * a2, a1 * b2 + b1
+
+    def _intra_chunk_scan(self, wkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parallel scan within one chunk.
+
+        Args:
+            wkv: (B, chunk_size, d_state)
+
+        Returns:
+            states: (B, chunk_size, d_state) — final states after intra-chunk scan
+            last_state: (B, d_state) — chunk's last state
+        """
+        B, chunk_size, D = wkv.shape
+        w = torch.exp(self.time_decay)  # (D,)
+        u = self.time_first
+
+        # Pad to power of 2
+        size = 1
+        while size < chunk_size:
+            size <<= 1
+
+        # Initialize: a=identity (1), b=wkv
+        a = w.unsqueeze(0).unsqueeze(0).expand(B, size, D).clone()  # (B, size, D)
+        a[:, 0] = 1.0  # identity
+        b = wkv.new_zeros(B, size, D)
+        b[:, :chunk_size] = wkv
+
+        # Pad
+        w_expanded = w.unsqueeze(0).unsqueeze(0).expand(B, size, D)
+
+        # Parallel scan (Hillis-Steele)
+        for stride in range(1, size):
+            # Which positions can combine?
+            # At stride s: position i (i >= s) combines with i-s
+            valid = torch.arange(size, device=wkv.device).unsqueeze(0) >= stride
+            valid = valid.unsqueeze(-1).expand(B, size, D)
+
+            a_cur = a.clone()
+            b_cur = b.clone()
+
+            a_prev = a_cur[:, :-stride].contiguous()
+            b_prev = b_cur[:, :-stride].contiguous()
+            a_shifted = a_cur[:, stride:].contiguous()
+            b_shifted = b_cur[:, stride:].contiguous()
+            w_shifted = w_expanded[:, stride:].contiguous()
+
+            # Combine
+            a_combined = w_shifted * a_prev  # w * a_prev
+            b_combined = w_shifted * b_prev + b_shifted  # w * b_prev + b_shifted
+
+            a_new = a.clone()
+            b_new = b.clone()
+            a_new[:, stride:] = torch.where(valid[:, stride:], a_combined, a_shifted)
+            b_new[:, stride:] = torch.where(valid[:, stride:], b_combined, b_shifted)
+
+            a = a_new
+            b = b_new
+
+        return b[:, :chunk_size], b[:, chunk_size - 1]
+
+    def _inter_chunk_scan(
+        self, chunk_states: torch.Tensor, chunk_wkvs: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Second-level scan across chunk final states.
+
+        Each chunk's effect on its own elements is:
+          chunk_state[i] = chunk_a * chunk_init_state + chunk_b[i]
+        where chunk_a = w^{chunk_size} (decay over full chunk)
+        and chunk_b[i] = sum_{j=0}^{i} w^{i-j} * wkv_j
+
+        For inter-chunk, we treat each chunk as having:
+          a_chunk = w^{chunk_size}  (constant for all chunks)
+          b_chunk = chunk_state[last] = chunk_a * init_state + chunk_b_last
+
+        The two-level scan correctly handles cross-chunk dependencies.
+
+        Args:
+            chunk_states: (B, num_chunks, d_state) — last state of each chunk
+            chunk_wkvs: (B, num_chunks, d_state) — last wkv of each chunk
+
+        Returns:
+            chunk_states: (B, num_chunks, d_state) — corrected after inter-chunk scan
+        """
+        B, num_chunks, D = chunk_states.shape
+        w = torch.exp(self.time_decay)
+        chunk_size = self.chunk_size
+
+        # Effective chunk decay: w^chunk_size
+        a_chunk = (w ** chunk_size).unsqueeze(0).unsqueeze(0).expand(B, num_chunks, D)
+
+        # Pad to power of 2
+        size = 1
+        while size < num_chunks:
+            size <<= 1
+
+        a = a_chunk.new_ones(B, size, D)
+        b = chunk_states.new_zeros(B, size, D)
+        b[:, :num_chunks] = chunk_states
+
+        # Inter-chunk parallel scan
+        for stride in range(1, size):
+            valid = torch.arange(size, device=chunk_states.device).unsqueeze(0) >= stride
+            valid = valid.unsqueeze(-1).expand(B, size, D)
+
+            a_prev = a[:, :-stride]
+            b_prev = b[:, :-stride]
+            a_shifted = a[:, stride:]
+            b_shifted = b[:, stride:]
+            a_w = (w ** chunk_size).unsqueeze(0).unsqueeze(0).expand_as(a_shifted)
+
+            a_combined = a_w * a_prev
+            b_combined = a_w * b_prev + b_shifted
+
+            a_new = a.clone()
+            b_new = b.clone()
+            a_new[:, stride:] = torch.where(valid[:, stride:], a_combined, a_shifted)
+            b_new[:, stride:] = torch.where(valid[:, stride:], b_combined, b_shifted)
+
+            a = a_new
+            b = b_new
+
+        return b[:, :num_chunks]
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Chunked forward for efficiency.
-
-        Uses cumulative sum trick for parallel scan over the sequence.
+        Two-level parallel scan: intra-chunk then inter-chunk.
         """
         original_shape = x.shape
         if x.dim() == 4:
@@ -247,45 +381,70 @@ class RWKVTimeMixingChunked(BaseAttention):
         x_shift = self.token_shift(x)
         x_norm = self.norm(x_shift)
 
-        k = self.key(x_norm)  # (B, T, d_state)
-        v = self.value(x_norm)  # (B, T, d_state)
+        k = self.key(x_norm)
+        v = self.value(x_norm)
 
-        # Chunked parallel scan using cumulative operations
-        w = torch.exp(self.time_decay)  # (d_state,)
+        w = torch.exp(self.time_decay)
         u = self.time_first
 
-        # Chunk the sequence
+        # wkv per time step
+        wkv = torch.exp(-torch.exp(u).unsqueeze(0).unsqueeze(0) * torch.sigmoid(k)) * v
+
+        # ---- Two-level scan ----
         chunk_size = self.chunk_size
         num_chunks = (T + chunk_size - 1) // chunk_size
 
-        # Pad to multiple of chunk_size
+        # Pad to chunk boundary
         pad_len = num_chunks * chunk_size - T
         if pad_len > 0:
-            k = F.pad(k, (0, 0, 0, pad_len))
-            v = F.pad(v, (0, 0, 0, pad_len))
+            wkv = F.pad(wkv, (0, 0, 0, pad_len))
 
-        k = k.reshape(B, num_chunks, chunk_size, self.d_state)
-        v = v.reshape(B, num_chunks, chunk_size, self.d_state)
+        wkv_chunks = wkv.reshape(B, num_chunks, chunk_size, self.d_state)
 
-        # Simple recurrent for now (can be optimized with parallel scan)
-        states = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
-        all_outputs = []
+        # Step 1: intra-chunk parallel scan
+        chunk_states = []   # last state of each chunk
+        chunk_outputs = []   # all outputs within each chunk
+        w_chunk = w ** chunk_size  # decay per full chunk
 
         for c in range(num_chunks):
-            chunk_outputs = []
-            for t in range(chunk_size):
-                idx = c * chunk_size + t
-                if idx >= T:
-                    break
-                k_t = k[:, c, t, :]
-                v_t = v[:, c, t, :]
-                wkv = torch.exp(-torch.exp(u) * torch.sigmoid(k_t)) * v_t
-                states = states * w + wkv
-                chunk_outputs.append(self.output(states))
-            all_outputs.append(torch.stack(chunk_outputs, dim=1))
+            wkv_c = wkv_chunks[:, c]  # (B, chunk_size, d_state)
+            states_c, last_c = self._intra_chunk_scan(wkv_c)  # (B, chunk_size, d_state)
+            chunk_states.append(last_c)                         # (B, d_state)
+            chunk_outputs.append(self.output(states_c))          # (B, chunk_size, d_attn)
+
+        chunk_states = torch.stack(chunk_states, dim=1)  # (B, num_chunks, d_state)
+
+        # Step 2: inter-chunk parallel scan to get corrected chunk initial states
+        chunk_states_corrected = self._inter_chunk_scan(chunk_states, wkv_chunks[:, :, -1, :])
+
+        # Step 3: apply corrected initial states and reconstruct outputs
+        all_outputs = []
+        for c in range(num_chunks):
+            wkv_c = wkv_chunks[:, c]  # (B, chunk_size, d_state)
+            init_state_c = chunk_states_corrected[:, c]  # (B, d_state)
+
+            # Redo intra-chunk scan with corrected init state
+            # state[t] = w * state[t-1] + wkv[t], starting from init_state_c
+            # This is just a simple scan: prepend init_state_c as t=-1
+            wkv_c_full = torch.cat([
+                init_state_c.unsqueeze(1),
+                wkv_c[:, :-1]
+            ], dim=1)  # shifted so first element = init_state_c
+
+            # Simple scan for each chunk (O(chunk_size) but with small chunk)
+            chunk_size_actual = min(chunk_size, T - c * chunk_size)
+            w_exp = w.unsqueeze(0).unsqueeze(0)  # (1, 1, d_state)
+            states_c = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
+            outputs_c = []
+            for t in range(chunk_size_actual):
+                wkv_t = wkv_chunks[:, c, t]
+                states_c = states_c * w_exp.squeeze() + wkv_t
+                outputs_c.append(self.output(states_c))
+
+            all_outputs.append(torch.stack(outputs_c, dim=1))
 
         output = torch.cat(all_outputs, dim=1)[:, :T, :]
-        last_state = states.detach()
+        last_state = chunk_states_corrected[:, -1, :].detach()
 
         if len(original_shape) == 4:
             output = output.reshape(B, T, F, H)

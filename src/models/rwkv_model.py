@@ -119,7 +119,6 @@ class SpectralRWKVLayer(nn.Module):
         self.dropout_time = nn.Dropout(dropout)
 
         # FFN (along H)
-        self.norm_ffn = nn.LayerNorm(h)
         self.ffn = FFNH(
             f=f, h=h, h_ffn_mult=h_ffn_mult, dropout=dropout
         )
