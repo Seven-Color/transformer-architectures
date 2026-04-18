@@ -1,0 +1,43 @@
+# RWKV-7 Configuration
+
+model:
+  name: "RWKV-7"
+  vocab_size: 65536
+  d_model: 512
+  num_layers: 8
+  d_state: 64
+  d_ffn: 2048
+  dropout: 0.1
+  shift_size: 0.5
+  max_seq_len: 4096
+  tie_weights: true
+  emb_dropout: 0.0
+
+data:
+  name: "SyntheticTextDataset"
+  seq_len: 128
+  train_samples: 10000
+  val_samples: 1000
+
+training:
+  epochs: 100
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 0.01
+  optimizer: "adamw"
+  scheduler: "cosine"
+  min_lr: 1e-6
+  warmup_epochs: 5
+  gradient_clip_norm: 1.0
+  use_amp: true
+
+logging:
+  log_dir: "./logs/rwkv"
+  log_interval: 100
+  save_interval: 10
+
+checkpoint:
+  save_dir: "./checkpoints/rwkv"
+  save_best: true
+  monitor: "val/loss"
+  mode: "min"
